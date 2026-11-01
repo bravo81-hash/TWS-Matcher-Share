@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Your settings and everything the app generates: never commit these
+config.json
+canonical_positions.json
+one_positions.json
+reconciliation.json
+optionstrat_urls.json
+iv_cache.json
+settlement_cache.json
+nav_history.json
+daily_pnl_universe.json
+risk_daily_validation.json
+flex_export/
+*.log
+*.csv
+*.xlsx
+*.mdb

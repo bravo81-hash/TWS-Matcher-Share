@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+ONE reader  —  Step 2 of the TWS / ONE / OptionStrat reconciliation system.
+
+Reads ONE's "Summary Report" or "Detail Report" CSV export (filter
+Status='Open', grouped by Account) and normalizes it to the SAME
+canonical leg schema the IBKR engine emits, so the two can be diffed.
+
+Why the CSV (not the .mdb): ONE's local user database is a
+password-encrypted ACE database; the password is ONE-internal (not the user
+login) so it can't be opened. The Summary Report export is the integration
+point and additionally carries ONE's recorded per-share price (AvgOpenPrice),
+which is the drift signal we hunt.
+
+WHAT IT DOES
+  - Walks the hierarchical report (group lines, TRADE rows, LEG rows).
+  - Keeps only OPEN legs (a leg row with a CloseDate/AvgClosePrice is closed).
+  - Signs qty: Buy = +, Sell = -.
+  - Parses the OSI symbol -> tradingClass (SPX vs SPXW...), expiry, strike, right.
+  - Nets legs by economic identity (account, tradingClass, expiry, strike, right)
+    into signed qty + qty-weighted avg price (ONE's commit price). The expiry
+    used is ONE's listed one, not the OSI symbol's -- see match_expiry().
+  - Writes one_positions.json in canonical shape.
+
+USAGE
+  python one_reader.py [path-to-ONESummaryReport.csv]
+  (defaults to the newest *ONESummaryReport*.csv in ~/Downloads, else the
+   bundled sample under ./samples/)
+"""
+
+from __future__ import annotations
+
+import csv
+import glob
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+
+import market_metrics
+import snapshots
+
+# OSI: root letters, optional pad spaces, 6-digit yymmdd, C/P, 8-digit strike*1000
+OSI_RE = re.compile(r"^([A-Z]+)\s*(\d{6})([CP])(\d{8})$")
+ACCOUNT_ORDER_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
+
+# Equity-index options are all x100; keep a map in case ONE ever lists others.
+DEFAULT_MULTIPLIER = 100.0
+
+DEFAULT_EXPORT_DIRS = [
+    os.path.join(os.path.expanduser("~"), "Downloads"),
+    os.path.join(os.path.expanduser("~"), "Documents"),   # ONE exports here
+]
+EXPORT_GLOBS = ("*ONESummaryReport*.csv", "*ONEDetailReport*.csv")
+SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "samples", "2026-06-24-ONESummaryReport.csv")
+OUTPUT_JSON = "one_positions.json"
+US_EASTERN = ZoneInfo("America/New_York")
+
+
+def _f(x, default=0.0):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_dmy(s: str):
+    """ONE's D/M/YYYY date (e.g. '17/07/2026') -> 'YYYYMMDD', or None."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%d/%m/%Y").strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+
+def is_expired(expiry: str | None, as_of: date | None = None) -> bool:
+    """Return whether an option expiry is before the current US trading date.
+
+    Expiry-day positions remain visible until that date has ended.  Using the
+    New York calendar also avoids hiding them early when the service runs from
+    some regions.
+    """
+    if not expiry:
+        return False
+    try:
+        expiry_date = datetime.strptime(str(expiry), "%Y%m%d").date()
+    except ValueError:
+        return False
+    trading_date = as_of or datetime.now(US_EASTERN).date()
+    return expiry_date < trading_date
+
+
+def match_expiry(leg: dict) -> str | None:
+    """The expiry a ONE leg should be reconciled on.
+
+    ONE carries two dates per leg: the one encoded in the OSI symbol, and the
+    ``Expiry`` column (``expiry_listed``) which is the real expiration.  The OSI
+    date runs a day late on most legs -- AM-settled monthlies encode the
+    Saturday, PM weeklies the Saturday after the Friday close -- so netting on
+    it forced a wide fuzzy-match window against IBKR's last-trade date.  The
+    listed expiry is the accurate one; fall back to the symbol only if ONE left
+    the column blank.
+    """
+    return leg.get("expiry_listed") or leg.get("expiry")
+
+
+def normalize_account_name(name: str | None) -> str:
+    """Remove ONE's optional report-order prefix (for example ``1.ALT``).
+
+    ONE adds these numeric prefixes when a report is grouped/sorted by Account.
+    They are presentation metadata, not part of the configured account name.
+    """
+    return ACCOUNT_ORDER_PREFIX_RE.sub("", str(name or "").strip())
+
+
+def parse_osi(symbol: str):
+    """'SPXW  260702P07400000' -> (tradingClass, expiry YYYYMMDD, right, strike)."""
+    m = OSI_RE.match(symbol.strip())
+    if not m:
+        return None
+    root, yymmdd, right, strike8 = m.groups()
+    expiry = "20" + yymmdd                      # 260702 -> 20260702
+    strike = int(strike8) / 1000.0
+    return root, expiry, right, strike
+
+
+def _row_kind(row: list[str]) -> str:
+    """Classify a raw CSV row: 'leg', 'trade', 'group', or 'other'.
+
+    LEG rows have 2 leading empty cells; TRADE rows have 1 leading empty cell
+    then a non-empty account; group lines are a lone account name."""
+    if len(row) >= 3 and row[0] == "" and row[1] == "" and row[2].strip():
+        return "leg"
+    if len(row) >= 2 and row[0] == "" and row[1].strip():
+        return "trade"
+    if len(row) >= 1 and row[0].strip() and all(c.strip() == "" for c in row[1:]):
+        return "group"
+    return "other"
+
+
+# Default LEG column indices (the standard ONE export order). Overridden per file
+# by the leg header row when present, so column reordering in ONE can't break us.
+DEFAULT_LEG_COLS = {
+    "Account": 2, "TradeId": 3, "Transaction": 5, "Qty": 6, "Symbol": 7,
+    "Expiry": 8, "Underlying": 11, "AvgOpenPrice": 12, "CloseDate": 14,
+}
+
+
+def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
+    cols = cols or DEFAULT_LEG_COLS
+
+    def g(name):
+        i = cols.get(name)
+        return row[i] if (i is not None and i < len(row)) else ""
+
+    account = normalize_account_name(g("Account"))
+    trade_id = g("TradeId").strip()
+    txn = g("Transaction").strip().lower()
+    qty = _f(g("Qty"))
+    symbol = g("Symbol").strip()
+    expiry_listed = _parse_dmy(g("Expiry").strip())   # ONE's actual expiration (Fri)
+    underlying = g("Underlying").strip()
+    # Summary reports expose AvgOpenPrice. Detail reports expose each fill as
+    # Price; those transactions are collapsed to the remaining open position
+    # by _collapse_detail_transactions().
+    avg_open = _f(g("AvgOpenPrice") or g("Price"))
+    close_date = g("CloseDate").strip()
+
+    if not symbol or qty == 0:
+        return None
+    parsed = parse_osi(symbol)
+    if not parsed:
+        print(f"  [warn] unparseable symbol: {symbol!r}")
+        return None
+    trading_class, expiry, right, strike = parsed
+
+    signed = qty if txn == "buy" else -qty
+    # Prefer ONE's listed expiry because an AM-settled monthly OSI symbol can
+    # carry the following Saturday.  ONE may leave an expired leg marked open;
+    # it is no longer an economic position and must not become ONE_ONLY.
+    expired = is_expired(expiry_listed or expiry)
+    is_open = close_date == "" and not expired
+    # ONE never books an expiry for you.  A leg past its expiration that still
+    # carries no CloseDate is not a position any more -- keeping it out of
+    # net_positions is right -- but ONE's P&L for that trade stays wrong until
+    # it is settled, so track it for find_unsettled_trades().
+    unsettled = expired and close_date == ""
+
+    return {
+        "account": account,
+        "trade_id": trade_id,
+        "underlying": underlying or trading_class,
+        "tradingClass": trading_class,
+        "expiry": expiry,                    # from OSI symbol (Sat for AM monthlies)
+        "expiry_listed": expiry_listed,      # ONE's actual expiration date (Fri)
+        "strike": strike,
+        "right": right,
+        "multiplier": DEFAULT_MULTIPLIER,
+        "qty": signed,
+        "open_price": avg_open,              # ONE's recorded per-share commit price
+        "is_open": is_open,
+        "is_expired": expired,
+        "unsettled_in_one": unsettled,
+        "symbol": symbol,
+    }
+
+
+def _collapse_detail_transactions(legs: list[dict]) -> list[dict]:
+    """Turn Detail Report transaction history into current open legs.
+
+    ONE's Detail Report contains every buy/sell belonging to each still-open
+    trade, including transactions that closed earlier legs. Maintain a moving
+    average for additions and preserve it for reductions; fully closed legs
+    disappear. This produces the same shape downstream code expects from a
+    Summary Report.
+    """
+    buckets = {}
+    for lg in legs:
+        key = (lg["account"], lg["trade_id"], lg["tradingClass"],
+               lg["expiry"], lg["strike"], lg["right"])
+        b = buckets.get(key)
+        delta = lg["qty"]
+        if b is None:
+            b = {"qty": 0.0, "avg": 0.0, "leg": lg.copy()}
+            buckets[key] = b
+
+        old_qty = b["qty"]
+        new_qty = old_qty + delta
+        if abs(old_qty) < 1e-9 or old_qty * delta > 0:
+            total = abs(old_qty) + abs(delta)
+            b["avg"] = ((abs(old_qty) * b["avg"] +
+                         abs(delta) * lg["open_price"]) / total
+                        if total else 0.0)
+        elif abs(delta) > abs(old_qty):
+            # The transaction crossed through flat and opened the other side.
+            b["avg"] = lg["open_price"]
+        # A partial reduction leaves the remaining position's entry unchanged.
+        b["qty"] = new_qty
+        b["leg"] = {**b["leg"], "trade_name": lg.get("trade_name")}
+
+    out = []
+    for b in buckets.values():
+        if abs(b["qty"]) < 1e-9:
+            continue
+        lg = b["leg"]
+        lg["qty"] = b["qty"]
+        lg["open_price"] = round(b["avg"], 4)
+        lg["is_open"] = True
+        out.append(lg)
+    return out
+
+
+def _is_leg_header(row):
+    return "Symbol" in row and "Transaction" in row and "Qty" in row
+
+
+def _is_trade_header(row):
+    return "TradeName" in row and "TradeId" in row and "Symbol" not in row
+
+
+def parse_trade_row(row: list[str], cols: dict | None) -> dict:
+    """A TRADE summary row -> its header fields (name, status, risk, ids)."""
+    cols = cols or {}
+
+    def g(name, default=""):
+        i = cols.get(name)
+        return row[i].strip() if (i is not None and i < len(row)) else default
+
+    # ONE labels this column per the report's Margin dropdown; under the
+    # "Max Absolute Risk" setting it is the trade's worst-case exposure.
+    margin_col = next((c for c in ("Margin", "MaxAbsRisk", "Max Abs Risk")
+                       if c in cols), None)
+    return {
+        "account": normalize_account_name(g("Account")),
+        "trade_id": g("TradeId"),
+        "trade_name": g("TradeName"),
+        "status": g("Status"),
+        "underlying": g("Underlying"),
+        "expiration": _parse_dmy(g("Expiration")),
+        "open_date": g("OpenDate"),
+        "margin": _f(row[cols[margin_col]]) if margin_col else None,
+        "has_margin_column": margin_col is not None,
+    }
+
+
+def read_summary_report(path: str, collect_trades: list | None = None):
+    """Parse a ONE report into leg dicts.
+
+    Pass a list as ``collect_trades`` to also receive the TRADE-level summary
+    rows; they carry the per-trade risk figure that find_ghost_trades() needs
+    and which the leg rows do not expose.
+    """
+    legs = []
+    current_name = None          # TradeName from the most recent TRADE data row
+    leg_cols = None              # name->index map from the leg header row
+    trade_cols = None            # name->index map from the trade header row
+    trade_name_idx = 5           # fallback (old layout); set from trade header
+    detail_mode = False
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.reader(fh)
+        for row in reader:
+            if not row:
+                continue
+            # header rows define column positions (ONE lets you reorder columns)
+            if _is_leg_header(row):
+                leg_cols = {name: i for i, name in enumerate(row) if name}
+                detail_mode = "Price" in leg_cols and "AvgOpenPrice" not in leg_cols
+                continue
+            if _is_trade_header(row):
+                trade_cols = {name: i for i, name in enumerate(row) if name}
+                trade_name_idx = trade_cols.get("TradeName", trade_name_idx)
+                continue
+            kind = _row_kind(row)
+            if kind == "trade":
+                current_name = (row[trade_name_idx].strip()
+                                if len(row) > trade_name_idx else "") or None
+                if collect_trades is not None:
+                    collect_trades.append(parse_trade_row(row, trade_cols))
+            elif kind == "leg":
+                leg = parse_leg_row(row, leg_cols)
+                if leg:
+                    leg["trade_name"] = current_name   # the combo name
+                    legs.append(leg)
+    return _collapse_detail_transactions(legs) if detail_mode else legs
+
+
+def net_positions(legs: list[dict]) -> list[dict]:
+    """Net OPEN legs by economic identity into canonical position rows."""
+    buckets: dict[tuple, dict] = {}
+    for lg in legs:
+        if not lg["is_open"]:
+            continue
+        key = (lg["account"], lg["tradingClass"], match_expiry(lg),
+               lg["strike"], lg["right"])
+        b = buckets.setdefault(key, {
+            "account": lg["account"],
+            "underlying": lg["underlying"],
+            "tradingClass": lg["tradingClass"],
+            "expiry": match_expiry(lg),
+            "expiry_osi": lg["expiry"],
+            "strike": lg["strike"],
+            "right": lg["right"],
+            "multiplier": lg["multiplier"],
+            "qty": 0.0,
+            "_px_num": 0.0,      # sum |qty| * price  -> qty-weighted avg
+            "_px_den": 0.0,
+            "trade_ids": set(),
+        })
+        b["qty"] += lg["qty"]
+        b["_px_num"] += abs(lg["qty"]) * lg["open_price"]
+        b["_px_den"] += abs(lg["qty"])
+        b["trade_ids"].add(lg["trade_id"])
+
+    out = []
+    for b in buckets.values():
+        if abs(b["qty"]) < 1e-9:             # fully flattened -> not a position
+            continue
+        avg = b["_px_num"] / b["_px_den"] if b["_px_den"] else 0.0
+        out.append({
+            "account": b["account"],
+            "underlying": b["underlying"],
+            "tradingClass": b["tradingClass"],
+            "expiry": b["expiry"],              # ONE's real expiration date
+            "expiry_osi": b["expiry_osi"],      # as encoded in the OSI symbol
+            "strike": b["strike"],
+            "right": b["right"],
+            "multiplier": b["multiplier"],
+            "qty": b["qty"],
+            "avg_price": round(avg, 4),
+            "source": "ONE",
+            "trade_ids": sorted(b["trade_ids"]),
+        })
+    out.sort(key=lambda r: (r["account"], r["underlying"], r["expiry"],
+                            r["strike"], r["right"]))
+    return out
+
+
+def _pretty_expiry(e):
+    return f"{e[:4]}-{e[4:6]}-{e[6:]}" if e and len(e) == 8 else e
+
+
+def print_table(positions: list[dict]) -> None:
+    by_acct: dict[str, list[dict]] = defaultdict(list)
+    for p in positions:
+        by_acct[p["account"]].append(p)
+
+    print("\n" + "=" * 74)
+    print(f"ONE OPEN POSITIONS (from Summary Report)   "
+          f"{datetime.now().isoformat(timespec='seconds')}")
+    print(f"ONE accounts: {', '.join(sorted(by_acct)) or '(none)'}")
+    print("=" * 74)
+    for acct in sorted(by_acct):
+        rows = by_acct[acct]
+        print(f"\n[{acct}]  {len(rows)} net legs")
+        print(f'    {"INSTRUMENT":<30}{"QTY":>7}{"ONE PX":>12}')
+        for r in rows:
+            lbl = f'{r["tradingClass"]} {_pretty_expiry(r["expiry"])} ' \
+                  f'{r["strike"]:g}{r["right"]}'
+            print(f'    {lbl:<30}{r["qty"]:>7.0f}{r["avg_price"]:>12.4f}')
+    print("=" * 74 + "\n")
+
+
+def print_ghost_trades(ghosts: list[dict]) -> None:
+    if not ghosts:
+        return
+    print("!" * 74)
+    print(f"GHOST TRADES  ({len(ghosts)})  --  open in ONE's report, but ONE holds")
+    print("no position for them: not selectable in Analysis, cannot be adjusted.")
+    print("!" * 74)
+    for g in ghosts:
+        print(f"\n  [{g['account']}]  #{g['trade_id']}  {g['trade_name']}"
+              f"   ({g['underlying']}, opened {g['open_date']})")
+        print(f"    flagged because {', and '.join(g['reasons'])}.")
+        for l in g["legs"]:
+            lbl = (f'{l["tradingClass"]} {_pretty_expiry(l["expiry"])} '
+                   f'{l["strike"]:g}{l["right"]}')
+            print(f'      {lbl:<30}{l["qty"]:>7.0f} @ {l["open_price"]:.2f}')
+        print("    FIX: rebuild it as a new trade in ONE's Analysis window, "
+              "then delete this one.")
+    print()
+
+
+def settlement_note(trade: dict) -> str:
+    """One line naming the print each settle price was struck against."""
+    st = trade.get("settlement") or {}
+    kind = "open (SOQ proxy)" if st.get("basis") == "open" else "close"
+    bits = [f"{trade.get('underlying')} settled {st.get('price'):,.2f} "
+            f"-- {_pretty_expiry(st.get('bar_date'))} {kind}",
+            f"{st.get('itm_legs', 0)} of {len(trade.get('legs') or [])} legs ITM"]
+    if trade.get("net_settlement") is not None:
+        bits.append(f"net settlement {trade['net_settlement']:+,.2f}")
+    if st.get("approximate"):
+        bits.append("AM-settled: verify against the official SET/RLS print")
+    if st.get("provisional"):
+        bits.append("session still open, provisional")
+    if st.get("assigned_shares"):
+        bits.append("physically settled: ITM legs deliver shares")
+    return "  |  ".join(bits)
+
+
+def print_unsettled_trades(trades: list[dict]) -> None:
+    if not trades:
+        return
+    print("!" * 74)
+    print(f"UNSETTLED EXPIRIES  ({len(trades)})  --  expired in the market, still")
+    print("open in ONE.  ONE's realised P&L for these trades is wrong until you")
+    print("settle them; the broker and this check both went quiet at expiry.")
+    print("!" * 74)
+    total = 0.0
+    priced = all(t.get("settlement") for t in trades)
+    for t in trades:
+        total += settled_pnl(t)
+        print()
+        print(f"  [{t['account']}]  #{t['trade_id']}  {t['trade_name']}"
+              f"   ({t['underlying']}, expired {_pretty_expiry(t['expiry'])})")
+        for l in t["legs"]:
+            lbl = (f'{l["tradingClass"]} {_pretty_expiry(l["expiry"])} '
+                   f'{l["strike"]:g}{l["right"]}')
+            tail = ("" if l.get("settle_price") is None else
+                    f'  ->  settle {l["settle_price"]:>8.2f}'
+                    + ("  ITM" if l.get("itm") else ""))
+            print(f'      {lbl:<30}{l["qty"]:>7.0f} @ '
+                  f'{l["open_price"]:>7.2f}{tail}')
+        if t.get("settlement"):
+            print(f"    {settlement_note(t)}")
+            print(f"    ENTER those settle prices in ONE  ->  realised "
+                  f"{t['pnl_settled']:+,.2f}")
+        else:
+            print(f"    settles {t['pnl_if_worthless']:+,.2f} if expired "
+                  f"worthless -- settlement print unavailable, so check "
+                  f"moneyness yourself; an ITM leg settles at intrinsic.")
+    print()
+    print(f"  TOTAL {'realised on settlement' if priced else 'if all expired worthless'}"
+          f": {total:+,.2f}")
+    print()
+
+
+def find_default_csv(search_dirs=None) -> str:
+    """Newest supported ONE report in Downloads/Documents, else sample."""
+    dirs = search_dirs or DEFAULT_EXPORT_DIRS
+    hits = []
+    for d in dirs:
+        for pattern in EXPORT_GLOBS:
+            hits += glob.glob(os.path.join(os.path.expanduser(d), pattern))
+    if hits:
+        return max(hits, key=os.path.getmtime)
+    return SAMPLE
+
+
+def extract_one_trades(legs: list[dict]) -> list[dict]:
+    """Group open ONE legs by (account, trade_id) to reconstruct active ONE trades."""
+    grouped = defaultdict(list)
+    for lg in legs:
+        if lg.get("is_open"):
+            grouped[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    trades = []
+    for (acct, tid), tlegs in grouped.items():
+        name = next((l.get("trade_name") for l in tlegs if l.get("trade_name")),
+                    None) or (f"Trade #{tid}" if tid else "Open Trade")
+        und = next((l.get("underlying") for l in tlegs if l.get("underlying")),
+                   tlegs[0].get("tradingClass"))
+        trades.append({
+            "account": acct,
+            "trade_id": tid,
+            "trade_name": name,
+            "underlying": und,
+            "legs": tlegs,
+        })
+    return trades
+
+
+def find_ghost_trades(trade_rows: list[dict], legs: list[dict]) -> list[dict]:
+    """ONE trades that report as Open but were never made into a position.
+
+    A Flex import writes transactions first and materialises a position in the
+    wizard's "link trades into positions" step.  If that step is left
+    incomplete, the trade still shows in the Reports/Trade Log views -- so its
+    legs land in this reader and reconcile fine -- while ONE holds no position
+    for it.  Such a trade cannot be selected in the Analysis window, so its legs
+    can never be adjusted, and ONE models no risk for it.
+
+    The tell is a zero risk figure on a trade that still holds open legs: no
+    real position has zero worst-case exposure.  A missing trade name is
+    corroborating (the wizard names a trade when it creates the position) but
+    is too weak on its own -- a hand-built trade may simply be unnamed.
+    """
+    open_legs = defaultdict(list)
+    for lg in legs:
+        if lg.get("is_open"):
+            open_legs[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    ghosts = []
+    for t in trade_rows:
+        # Without the risk column there is nothing to test; stay silent rather
+        # than flag every trade in the export.
+        if not t.get("has_margin_column") or t.get("margin") is None:
+            continue
+        if str(t.get("status", "")).lower() != "open":
+            continue
+        tlegs = open_legs.get((t["account"], t["trade_id"]), [])
+        if not tlegs or abs(t["margin"]) > 1e-9:
+            continue
+        reasons = ["ONE models no risk for it (Max Abs Risk = 0)"]
+        if not t["trade_name"]:
+            reasons.append("it has no trade name")
+        ghosts.append({
+            "account": t["account"],
+            "trade_id": t["trade_id"],
+            "trade_name": t["trade_name"] or f"(unnamed trade #{t['trade_id']})",
+            "underlying": t["underlying"],
+            "expiration": t["expiration"],
+            "open_date": t["open_date"],
+            "margin": t["margin"],
+            "leg_count": len(tlegs),
+            "reasons": reasons,
+            "legs": [{
+                "tradingClass": l["tradingClass"], "expiry": match_expiry(l),
+                "strike": l["strike"], "right": l["right"],
+                "qty": l["qty"], "open_price": l["open_price"],
+            } for l in sorted(tlegs, key=lambda x: (x["strike"], x["right"]))],
+        })
+    ghosts.sort(key=lambda g: (g["account"], g["trade_id"]))
+    return ghosts
+
+
+def find_unsettled_trades(legs: list[dict]) -> list[dict]:
+    """ONE trades holding legs that expired but were never settled.
+
+    IBKR drops an expired option from positions, and this reader stops treating
+    it as open, so the leg quietly leaves the reconciliation on the day after
+    expiry -- both sides go silent and every account reads MATCH.  ONE, though,
+    only books the expiry when the user does, so the trade's realised P&L stays
+    wrong, by the whole value of the legs, indefinitely.
+
+    ``pnl_if_worthless`` is what ONE will realise if the legs are settled at
+    zero.  That is the common case but not the only one: a leg that finished in
+    the money was exercised or assigned and has to be settled at its intrinsic
+    value instead, so the figure is a reference, not an instruction.
+    """
+    grouped = defaultdict(list)
+    for lg in legs:
+        if lg.get("unsettled_in_one"):
+            grouped[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    out = []
+    for (acct, tid), tlegs in grouped.items():
+        name = next((l.get("trade_name") for l in tlegs if l.get("trade_name")),
+                    None) or (f"Trade #{tid}" if tid else "Open Trade")
+        pnl = sum(-l["qty"] * l["open_price"] * (l.get("multiplier") or
+                                                 DEFAULT_MULTIPLIER)
+                  for l in tlegs)
+        out.append({
+            "account": acct,
+            "trade_id": tid,
+            "trade_name": name,
+            "underlying": next((l.get("underlying") for l in tlegs
+                                if l.get("underlying")), None),
+            "expiry": min(l.get("expiry_listed") or l["expiry"] for l in tlegs),
+            "pnl_if_worthless": round(pnl, 2),
+            "legs": [{
+                "tradingClass": l["tradingClass"],
+                "expiry": match_expiry(l), "strike": l["strike"],
+                "right": l["right"], "qty": l["qty"],
+                "open_price": l["open_price"],
+                "multiplier": l.get("multiplier") or DEFAULT_MULTIPLIER,
+            } for l in sorted(tlegs, key=lambda x: (x["right"], x["strike"]))],
+        })
+    out.sort(key=lambda t: (t["expiry"], t["account"], str(t["trade_id"])))
+    return out
+
+
+def apply_settlement(trades: list[dict], closes: dict) -> list[dict]:
+    """Price unsettled expiries against the print that actually settled them.
+
+    ``closes`` is ``market_metrics.collect_settlement_closes()`` output. Each
+    leg gains ``settle_price`` -- the value to type into ONE, which is the leg's
+    intrinsic value against the settlement print and 0 only if it finished out
+    of the money -- and each trade gains ``pnl_settled``, the realised P&L that
+    follows from those values.
+
+    ``pnl_if_worthless`` and the settled figure agree more often than they
+    deserve to, because a balanced condor's intrinsics cancel; they part company
+    the moment the print lands inside the structure, which is exactly when
+    guessing zero costs real money. Trades whose print could not be fetched are
+    left untouched and every renderer falls back to the worthless case.
+    """
+    for t in trades or []:
+        legs = t.get("legs") or []
+        rec = closes.get((str(t.get("underlying") or "").upper(),
+                          str(t.get("expiry"))))
+        if not rec or not legs:
+            continue
+        klass = next((l.get("tradingClass") for l in legs
+                      if l.get("tradingClass")), None)
+        basis = market_metrics.settlement_basis(klass, t.get("underlying"))
+        px = rec.get(basis)
+        if px is None:
+            continue
+
+        net = 0.0
+        for l in legs:
+            strike = l.get("strike")
+            if strike is None:
+                continue
+            intrinsic = (max(0.0, px - strike) if l.get("right") == "C"
+                         else max(0.0, strike - px))
+            l["settle_price"] = round(intrinsic, 2)
+            l["itm"] = l["settle_price"] > 0
+            net += (l["settle_price"] * l["qty"]
+                    * (l.get("multiplier") or DEFAULT_MULTIPLIER))
+
+        cash = market_metrics.is_cash_settled(klass, t.get("underlying"))
+        t["settlement"] = {
+            "price": px,
+            "basis": basis,
+            "bar_date": rec.get("bar_date"),
+            # an AM settlement is the SOQ, not the index's own open
+            "approximate": basis == "open",
+            "provisional": bool(rec.get("provisional")),
+            "cash_settled": cash,
+            "assigned_shares": (not cash) and any(l.get("itm") for l in legs),
+            "itm_legs": sum(1 for l in legs if l.get("itm")),
+        }
+        t["net_settlement"] = round(net, 2)
+        t["pnl_settled"] = round(t["pnl_if_worthless"] + net, 2)
+    return trades
+
+
+def settled_pnl(trade: dict) -> float:
+    """Realised P&L for an unsettled expiry: priced if we have the print."""
+    v = trade.get("pnl_settled")
+    return v if v is not None else trade.get("pnl_if_worthless", 0.0)
+
+
+def build_one_snapshot(path: str) -> dict:
+    """Read a ONE Summary Report CSV -> canonical ONE snapshot dict.
+    Reused by the dashboard daemon (no console output / file write)."""
+    trade_rows = []
+    legs = read_summary_report(path, collect_trades=trade_rows)
+    positions = net_positions(legs)
+    trades = extract_one_trades(legs)
+    return {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "source": "ONE/SummaryReport",
+        "source_file": path,
+        "source_mtime": os.path.getmtime(path) if os.path.exists(path) else None,
+        "accounts": sorted({p["account"] for p in positions}),
+        "positions": positions,
+        "trades": trades,
+        "ghost_trades": find_ghost_trades(trade_rows, legs),
+        "unsettled_trades": find_unsettled_trades(legs),
+        "raw_legs": legs,
+    }
+
+
+def main() -> None:
+    path = sys.argv[1] if len(sys.argv) > 1 else find_default_csv()
+    print(f"Reading ONE Summary Report: {path}")
+    snapshot = build_one_snapshot(path)
+    legs, positions = snapshot["raw_legs"], snapshot["positions"]
+    trades, ghosts = snapshot["trades"], snapshot["ghost_trades"]
+    open_legs = [l for l in legs if l["is_open"]]
+    print(f"Parsed {len(legs)} leg rows  ({len(open_legs)} open, "
+          f"{len(legs) - len(open_legs)} closed)")
+
+    print_table(positions)
+    print_ghost_trades(ghosts)
+    print_unsettled_trades(snapshot["unsettled_trades"])
+
+    snapshots.write_json_atomic(OUTPUT_JSON, snapshot)
+    print(f"Wrote {OUTPUT_JSON}  ({len(positions)} net positions across "
+          f"{len(snapshot['accounts'])} accounts, {len(trades)} active ONE trades)")
+
+
+if __name__ == "__main__":
+    main()
